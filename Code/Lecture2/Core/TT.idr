@@ -62,6 +62,8 @@ data IsVar : Name -> Nat -> List Name -> Type where
 public export
 dropVar : (ns : List Name) -> {idx : Nat} ->
           (0 p : IsVar name idx ns) -> List Name
+dropVar (n :: ns) {idx = 0} p = ns
+dropVar (n :: ns) {idx = (S k)} (Later p) = n :: (dropVar ns {idx=k} p)
 
 public export
 data Var : List Name -> Type where
@@ -87,6 +89,24 @@ Functor Binder where
   map func (PVar ty) = PVar (func ty)
   map func (PVTy ty) = PVTy (func ty)
 
+export
+Foldable Binder where
+  foldr f init (Lam i ty) = f ty init
+  foldr f init (Pi i ty) = f ty init
+  foldr f init (PVar ty) = f ty init
+  foldr f init (PVTy ty) = f ty init
+  foldl f init (Lam i ty) = f init ty
+  foldl f init (Pi i ty) = f init ty
+  foldl f init (PVar ty) = f init ty
+  foldl f init (PVTy ty) = f init ty
+
+export
+Traversable Binder where
+  traverse f (Lam i ty) = Lam i <$> f ty
+  traverse f (Pi i ty) = Pi i <$> f ty
+  traverse f (PVar ty) = PVar <$> f ty
+  traverse f (PVTy ty) = PVTy <$> f ty
+
 public export
 data Term : List Name -> Type where
      Local : (idx : Nat) -> -- de Bruijn index
@@ -104,25 +124,133 @@ data Term : List Name -> Type where
 
 -- Term manipulation
 
+weakenVar : {outer : _} ->
+            Var (outer ++ vars) ->
+            Var (outer ++ (x :: vars))
+weakenVar (MkVar p) {outer = []} = MkVar (Later p)
+weakenVar (MkVar First) {outer = (y::ys)} = MkVar First
+weakenVar (MkVar (Later p)) {outer = (y::ys)}
+    = let MkVar p' = weakenVar {outer=ys} (MkVar p) in
+      MkVar (Later p')
+
+weakenHelper : {outer : _} ->
+               Term (outer ++ vars) ->
+               Term (outer ++ (x :: vars))
+weakenHelper (Local idx p)
+    = let (MkVar {i=i'} p') = weakenVar (MkVar p) in
+      Local i' p'
+weakenHelper (Ref y z) = Ref y z
+weakenHelper (Meta y ys) = Meta y (map weakenHelper ys)
+weakenHelper (Bind y b scope)
+    = Bind y (map weakenHelper b) (weakenHelper {outer=y::outer} scope)
+weakenHelper (App y z) = App (weakenHelper y) (weakenHelper z)
+weakenHelper TType = TType
+weakenHelper Erased = Erased
+
 export
 weaken : Term vars -> Term (x :: vars)
+weaken = weakenHelper {outer=[]}
+
+embedVar : Var (vars) ->
+           Var (vars ++ more)
+embedVar (MkVar First) = MkVar First
+embedVar (MkVar (Later p))
+    = let MkVar p' = embedVar (MkVar p) in
+      MkVar (Later p')
 
 export
 embed : Term vars -> Term (vars ++ more)
+embed (Local idx p)
+    = let MkVar {i} p' = embedVar (MkVar p) in
+      Local i p'
+embed (Ref x y) = Ref x y
+embed (Meta x xs) = Meta x (map embed xs)
+embed (Bind x b scope) = Bind x (map embed b) (embed scope)
+embed (App x y) = App (embed x) (embed y)
+embed TType = TType
+embed Erased = Erased
+
+contractVar : {outer : _} ->
+                Var (outer ++ x :: vars) -> 
+                Maybe (Var (outer ++ vars))
+contractVar (MkVar First) {outer = []} = Nothing
+contractVar (MkVar (Later p)) {outer = []} = pure (MkVar p)
+contractVar (MkVar First) {outer = (y::ys)} = pure (MkVar First)
+contractVar (MkVar (Later p)) {outer = (y::ys)}
+    = do MkVar q <- contractVar (MkVar p) {outer=ys}
+         pure (MkVar (Later q))
+
+contractHelper : {outer : _} ->
+                 Term (outer ++ x :: vars) ->
+                 Maybe (Term (outer ++ vars))
+contractHelper (Local i p)
+    = do MkVar {i=i'} p' <- contractVar (MkVar p)
+         pure (Local i' p')
+contractHelper (Ref x y) = pure (Ref x y)
+contractHelper (Meta x xs)
+    = do xs' <- traverse contractHelper xs
+         pure (Meta x xs')
+contractHelper (Bind n b scope)
+    = do b' <- traverse contractHelper b
+         scope'<- contractHelper {outer = n :: outer} scope
+         pure (Bind n b' scope')
+contractHelper (App y z)
+    = do y' <- contractHelper y
+         z' <- contractHelper z
+         pure (App y' z')
+contractHelper TType = pure TType
+contractHelper Erased = pure Erased
 
 export
 contract : Term (x :: vars) -> Maybe (Term vars)
+contract = contractHelper {outer=[]}
+
+substHelper : {outer : _} ->
+              Term (outer ++ vars) ->
+              Term (outer ++ x :: vars) ->
+              Term (outer ++ vars)
+substHelper v (Local idx p)
+    = case contractVar (MkVar p) of
+           Nothing => v
+           Just (MkVar {i} p') => Local i p'
+substHelper v (Ref t n) = Ref t n
+substHelper v (Meta n ctx) = Meta n (map (substHelper v) ctx)
+substHelper v (Bind n b scope)
+    = Bind n (map (substHelper v) b) (substHelper (weaken v) scope {outer=n::outer})
+substHelper v (App y z) = App (substHelper v y) (substHelper v z)
+substHelper v TType = TType
+substHelper v Erased = Erased
 
 export
 subst : Term vars -> Term (x :: vars) -> Term vars
+subst = substHelper {outer=[]}
 
 public export
 data CompatibleVars : List Name -> List Name -> Type where
      CompatPre : CompatibleVars xs xs
      CompatExt : CompatibleVars xs ys -> CompatibleVars (n :: xs) (m :: ys)
 
+renameVarsVar : CompatibleVars xs ys ->
+                Var xs ->
+                Var ys
+renameVarsVar CompatPre v = v
+renameVarsVar (CompatExt c) (MkVar First) = MkVar First
+renameVarsVar (CompatExt c) (MkVar (Later p))
+    = let MkVar p' = renameVarsVar c (MkVar p) in
+      MkVar (Later p')
+
 export
 renameVars : CompatibleVars xs ys -> Term xs -> Term ys
+renameVars c (Local i p)
+    = let MkVar {i=i'} p' = renameVarsVar c (MkVar p) in
+      Local i' p'
+renameVars c (Ref t n) = Ref t n
+renameVars c (Meta n ctx) = Meta n (map (renameVars c) ctx)
+renameVars c (Bind n b scope)
+    = Bind n (map (renameVars c) b) (renameVars (CompatExt c) scope)
+renameVars c (App x y) = App (renameVars c x) (renameVars c y)
+renameVars c TType = TType
+renameVars c Erased = Erased
 
 --- Show instances
 
@@ -152,7 +280,7 @@ nameAt : {vars : _} ->
 nameAt {vars = n :: ns} Z First = n
 nameAt {vars = n :: ns} (S k) (Later p) = nameAt k p
 
-export 
+export
 {vars : _} -> Show (Term vars) where
   show tm = let (fn, args) = getFnArgs tm in showApp fn args
     where
