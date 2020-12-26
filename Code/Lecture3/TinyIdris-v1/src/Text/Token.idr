@@ -18,7 +18,7 @@ module Text.Token
 |||   tokValue SKComma x = ()
 ||| ```
 public export
-interface TokenKind (k : Type) where
+interface TokenKind (0 k : Type) where
   ||| The type that a token of this kind converts to.
   TokType : k -> Type
 
@@ -37,4 +37,4 @@ record Token k where
 ||| the kind of token.
 public export
 value : TokenKind k => (t : Token k) -> TokType (kind t)
-value (Tok k x) = tokValue k x
+value (Tok k' x) = tokValue k' x

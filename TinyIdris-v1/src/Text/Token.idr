@@ -37,4 +37,4 @@ record Token k where
 ||| the kind of token.
 public export
 value : TokenKind k => (t : Token k) -> TokType (kind t)
-value (Tok k x) = tokValue k x
+--value (Tok k x) = tokValue k x
